@@ -3,11 +3,13 @@ from typing import List, Optional
 import json
 from collections import defaultdict
 from django import forms
+from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 from pretix.base.models import SeatCategoryMapping, SeatingPlan
 from pretix.base.models.seating import SeatingPlanLayoutValidator
 from pretix.base.services import seating as seating_service
+from .seats import ensure_subevent_seats
 
 
 class SeatingPlanSettingsForm(forms.Form):
@@ -147,8 +149,13 @@ class SeatingPlanSettingsForm(forms.Form):
             self.event.seating_plan = plan
             self.event.save(update_fields=["seating_plan"])
 
-        mapping = self._persist_category_mapping()
-        seating_service.generate_seats(self.event, None, plan, mapping)
+        with transaction.atomic():
+            mapping = self._persist_category_mapping()
+            seating_service.generate_seats(self.event, None, plan, mapping)
+            # Populate existing dates when configuring the event. New dates are
+            # initialized lazily by the checkout views.
+            for subevent in self.event.subevents.all():
+                ensure_subevent_seats(self.event, subevent)
 
         self.event.settings.quse_seatingplan_checkout_enabled = True
         self.event.settings.quse_seatingplan_name = plan_name

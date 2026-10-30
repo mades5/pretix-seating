@@ -14,6 +14,7 @@ from pretix.presale.views.cart import get_or_create_cart_id
 from pretix.presale.views.event import SeatingPlanView
 
 from .forms import SeatingPlanSettingsForm
+from .seats import ensure_subevent_seats
 
 
 class SeatingPlanSettingsView(EventSettingsViewMixin, EventSettingsFormView):
@@ -74,6 +75,17 @@ class EmbeddedSeatingPlanView(SeatingPlanView):
     """Drop X-Frame-Options so the plan can be embedded on the product page."""
 
     def dispatch(self, request, *args, **kwargs):
+        # pretix's SeatingPlanView expects a plan on the selected subevent. QUSE
+        # deliberately supports event-level plans for series, so use that plan
+        # when the subevent has none. Keep the request's subevent intact: the
+        # core view still scopes availability and cart operations to the date.
+        subevent_id = kwargs.get("subevent")
+        if subevent_id and request.event.has_subevents:
+            subevent = request.event.subevents.filter(pk=subevent_id).first()
+            if subevent and not subevent.seating_plan:
+                subevent.seating_plan = request.event.seating_plan
+            if subevent:
+                ensure_subevent_seats(request.event, subevent)
         response = super().dispatch(request, *args, **kwargs)
         response.xframe_options_exempt = True
         return response
@@ -93,12 +105,14 @@ class SeatingPlanDataView(EventViewMixin, CartMixin, View):
             subevent = self._get_subevent()
         except Http404:
             return self._json_error(_("Unknown subevent."), status=404)
-        owner = subevent or request.event
-        if not owner.seating_plan:
+        plan = (subevent.seating_plan if subevent else None) or request.event.seating_plan
+        if not plan:
             return self._json_error(
                 _("No seating plan is configured for this event."), status=404
             )
-        payload = self._build_payload(owner.seating_plan, subevent)
+        if subevent:
+            ensure_subevent_seats(request.event, subevent)
+        payload = self._build_payload(plan, subevent)
         return JsonResponse(payload)
 
     def _get_subevent(self):
@@ -187,12 +201,15 @@ class SeatingPlanDataView(EventViewMixin, CartMixin, View):
 
     def _cart_positions(self, subevent):
         target = subevent.pk if subevent else None
-        product_ids = set(
-            SeatCategoryMapping.objects.filter(
+        mappings = SeatCategoryMapping.objects.filter(
                 event=self.request.event,
                 subevent=subevent,
-            ).values_list("product_id", flat=True)
-        )
+            )
+        if subevent and not mappings.exists():
+            mappings = SeatCategoryMapping.objects.filter(
+                event=self.request.event, subevent=None
+            )
+        product_ids = set(mappings.values_list("product_id", flat=True))
         return [
             pos
             for pos in self.positions
@@ -209,6 +226,10 @@ class SeatingPlanDataView(EventViewMixin, CartMixin, View):
         mappings = SeatCategoryMapping.objects.filter(
             event=self.request.event, subevent=subevent
         ).select_related("product")
+        if subevent and not mappings.exists():
+            mappings = SeatCategoryMapping.objects.filter(
+                event=self.request.event, subevent=None
+            ).select_related("product")
         for mapping in mappings:
             color = palette.get(mapping.layout_category)
             legend.append(
@@ -409,6 +430,8 @@ class SeatAssignmentView(EventViewMixin, CartMixin, View):
             )
         seat_guid = payload.get("seat_guid")
         subevent = cart_position.subevent
+        if subevent:
+            ensure_subevent_seats(request.event, subevent)
         allowed_products = set(
             SeatCategoryMapping.objects.filter(
                 event=request.event, subevent=subevent
