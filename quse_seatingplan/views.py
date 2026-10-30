@@ -1,4 +1,5 @@
 import json
+from functools import wraps
 from django.db import transaction
 from django.http import Http404, JsonResponse
 from django.urls import reverse
@@ -86,6 +87,20 @@ class EmbeddedSeatingPlanView(SeatingPlanView):
                 subevent.seating_plan = request.event.seating_plan
             if subevent:
                 ensure_subevent_seats(request.event, subevent)
+                # SeatingPlanView.get() fetches the subevent again through the
+                # related manager. Serve the already-loaded, request-local
+                # object for that lookup so its effective plan survives. This
+                # does not save the fallback to the SubEvent row.
+                manager = request.event.subevents
+                original_get = manager.get
+
+                @wraps(original_get)
+                def get_with_plan(*args, **lookup):
+                    if lookup.get("pk") == subevent.pk or lookup.get("id") == subevent.pk:
+                        return subevent
+                    return original_get(*args, **lookup)
+
+                manager.get = get_with_plan
         response = super().dispatch(request, *args, **kwargs)
         response.xframe_options_exempt = True
         return response
